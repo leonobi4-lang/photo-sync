@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  photo_sync:
+    build: .
+    container_name: photo_sync
+    restart: "no"
+    volumes:
+      - /volume1/media/photos/duplicates:/duplicates
+      - /volume1/media/photos/sorted:/sorted
+    environment:
+      - TZ=Asia/Vientiane
+      - HASH_ALGO=md5
+      - DRY_RUN=true
+      - IGNORE_DIRS=@eaDir,tmp,cache
+      - PROGRESS_INTERVAL=10000
+    command: ["/run.sh"]
