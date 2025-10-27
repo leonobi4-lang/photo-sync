@@ -2,6 +2,7 @@ import os
 import hashlib
 import shutil
 import exifread
+import json
 from datetime import datetime
 from tqdm import tqdm
 import argparse
@@ -12,20 +13,18 @@ import sys
 SORTED_DIR = "/sorted"
 DUPLICATES_DIR = "/duplicates"
 LOG_DIR = "/logs"
+CACHE_FILE = os.path.join(LOG_DIR, "hash_cache.json")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"sync_{datetime.now():%Y%m%d_%H%M%S}.log")
 
-# === Логирование (в файл + stdout) ===
+# === Настройка логирования ===
 logger = logging.getLogger("photo_sync")
 logger.setLevel(logging.INFO)
-
 file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 console_handler = logging.StreamHandler(sys.stdout)
-
 formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
 file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
-
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
@@ -56,32 +55,55 @@ def get_date_taken(path):
 
 
 def build_hash_map(base_path):
-    """Создаёт карту {hash: relative_path}"""
+    """Создаёт карту {hash: relative_path} с кэшем"""
+    cache = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except json.JSONDecodeError:
+            logger.warning("⚠️ Cache file is corrupted, rebuilding from scratch.")
+            cache = {}
+
     file_map = {}
-    for root, _, files in os.walk(base_path):
-        for f in files:
-            full_path = os.path.join(root, f)
-            h = hash_file(full_path)
+    files = [os.path.join(root, f)
+             for root, _, fs in os.walk(base_path)
+             for f in fs if f.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov"))]
+
+    for full_path in tqdm(files, desc=f"Hashing {base_path}", unit="file"):
+        try:
+            mtime = os.path.getmtime(full_path)
+            key = f"{full_path}:{mtime}"
+            if key in cache:
+                h = cache[key]
+            else:
+                h = hash_file(full_path)
+                cache[key] = h
             if h:
                 file_map[h] = os.path.relpath(full_path, base_path)
+        except Exception:
+            continue
+
+    # обновляем кэш
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f)
     return file_map
 
 
 def main(dry_run=False):
-    logger.info("🔍 Scanning sorted directory...")
+    logger.info("🔍 Scanning sorted directory (this may take time)...")
     sorted_map = build_hash_map(SORTED_DIR)
     logger.info(f"✅ Found {len(sorted_map)} unique files in sorted folder.")
 
     logger.info("📁 Scanning duplicates directory...")
-    dup_files = []
-    for root, _, files in os.walk(DUPLICATES_DIR):
-        for f in files:
-            dup_files.append(os.path.join(root, f))
+    dup_files = [os.path.join(root, f)
+                 for root, _, files in os.walk(DUPLICATES_DIR)
+                 for f in files if f.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov"))]
     logger.info(f"🧩 Found {len(dup_files)} files in duplicates folder.")
 
     moved_count = skipped = errors = 0
 
-    for f in tqdm(dup_files, desc="Processing", unit="file"):
+    for f in tqdm(dup_files, desc="Processing duplicates", unit="file"):
         try:
             h = hash_file(f)
             if not h:
