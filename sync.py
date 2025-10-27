@@ -3,9 +3,9 @@ import hashlib
 import shutil
 import exifread
 import json
+import time
 from datetime import datetime
 from tqdm import tqdm
-import argparse
 import logging
 import sys
 
@@ -17,16 +17,18 @@ CACHE_FILE = os.path.join(LOG_DIR, "hash_cache.json")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"sync_{datetime.now():%Y%m%d_%H%M%S}.log")
 
-# === Настройка логирования ===
+# === Настройка логов ===
 logger = logging.getLogger("photo_sync")
 logger.setLevel(logging.INFO)
-file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-console_handler = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
-file_handler.setFormatter(formatter)
-console_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+fmt = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
+fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+ch = logging.StreamHandler(sys.stdout)
+fh.setFormatter(fmt)
+ch.setFormatter(fmt)
+logger.addHandler(fh)
+logger.addHandler(ch)
+
+HEARTBEAT_INTERVAL = 60  # сек между сообщениями “ещё жив”
 
 
 def hash_file(path):
@@ -42,9 +44,9 @@ def hash_file(path):
 
 
 def get_date_taken(path):
-    """Извлекает дату съёмки из EXIF (если есть)"""
+    """Пытается извлечь дату съёмки из EXIF"""
     try:
-        with open(path, 'rb') as f:
+        with open(path, "rb") as f:
             tags = exifread.process_file(f, stop_tag="EXIF DateTimeOriginal", details=False)
         date_str = str(tags.get("EXIF DateTimeOriginal"))
         if date_str:
@@ -61,16 +63,20 @@ def build_hash_map(base_path):
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 cache = json.load(f)
-        except json.JSONDecodeError:
-            logger.warning("⚠️ Cache file is corrupted, rebuilding from scratch.")
+        except Exception:
+            logger.warning("⚠️ Повреждён кэш, пересчитываю с нуля.")
             cache = {}
 
     file_map = {}
-    files = [os.path.join(root, f)
-             for root, _, fs in os.walk(base_path)
-             for f in fs if f.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov"))]
+    files = [
+        os.path.join(root, f)
+        for root, _, fs in os.walk(base_path)
+        for f in fs
+        if f.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov"))
+    ]
 
-    for full_path in tqdm(files, desc=f"Hashing {base_path}", unit="file"):
+    last_beat = time.time()
+    for i, full_path in enumerate(tqdm(files, desc=f"Hashing {base_path}", unit="file")):
         try:
             mtime = os.path.getmtime(full_path)
             key = f"{full_path}:{mtime}"
@@ -84,31 +90,39 @@ def build_hash_map(base_path):
         except Exception:
             continue
 
-    # обновляем кэш
+        # heartbeat каждые 60 с
+        if time.time() - last_beat >= HEARTBEAT_INTERVAL:
+            pct = (i + 1) / len(files) * 100 if files else 0
+            logger.info(f"💓 Hashing progress: {i+1}/{len(files)} ({pct:.2f}%)")
+            last_beat = time.time()
+
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache, f)
     return file_map
 
 
-def main(dry_run=False):
-    logger.info("🔍 Scanning sorted directory (this may take time)...")
+def main():
+    logger.info("🔍 Сканирую каталог /sorted (это может занять время)...")
     sorted_map = build_hash_map(SORTED_DIR)
-    logger.info(f"✅ Found {len(sorted_map)} unique files in sorted folder.")
+    logger.info(f"✅ Найдено {len(sorted_map)} уникальных файлов в sorted.")
 
-    logger.info("📁 Scanning duplicates directory...")
-    dup_files = [os.path.join(root, f)
-                 for root, _, files in os.walk(DUPLICATES_DIR)
-                 for f in files if f.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov"))]
-    logger.info(f"🧩 Found {len(dup_files)} files in duplicates folder.")
+    logger.info("📁 Сканирую каталог /duplicates ...")
+    dup_files = [
+        os.path.join(root, f)
+        for root, _, files in os.walk(DUPLICATES_DIR)
+        for f in files
+        if f.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov"))
+    ]
+    logger.info(f"🧩 Найдено {len(dup_files)} файлов в duplicates.")
 
     moved_count = skipped = errors = 0
+    last_beat = time.time()
 
-    for f in tqdm(dup_files, desc="Processing duplicates", unit="file"):
+    for i, f in enumerate(tqdm(dup_files, desc="Processing duplicates", unit="file")):
         try:
             h = hash_file(f)
             if not h:
                 continue
-
             if h in sorted_map:
                 logger.info(f"[SKIPPED] {f} (duplicate)")
                 skipped += 1
@@ -119,25 +133,24 @@ def main(dry_run=False):
             os.makedirs(dest_dir, exist_ok=True)
             dest_path = os.path.join(dest_dir, os.path.basename(f))
 
-            if dry_run:
-                logger.info(f"[DRY-RUN] Would move {f} -> {dest_path}")
-            else:
-                shutil.move(f, dest_path)
-                logger.info(f"[MOVED] {f} -> {dest_path}")
-                moved_count += 1
+            shutil.move(f, dest_path)
+            logger.info(f"[MOVED] {f} -> {dest_path}")
+            moved_count += 1
 
         except Exception as e:
             logger.error(f"[ERROR] {f}: {e}")
             errors += 1
 
-    logger.info("✅ Sync complete.")
-    logger.info(f"📦 Moved: {moved_count}, 🧩 Skipped: {skipped}, ⚠️ Errors: {errors}")
-    logger.info(f"📄 Log file saved to: {LOG_FILE}")
+        # heartbeat каждые 60 с
+        if time.time() - last_beat >= HEARTBEAT_INTERVAL:
+            pct = (i + 1) / len(dup_files) * 100 if dup_files else 0
+            logger.info(f"💓 Still running... processed {i+1}/{len(dup_files)} ({pct:.2f}%)")
+            last_beat = time.time()
+
+    logger.info("✅ Синхронизация завершена.")
+    logger.info(f"📦 Перемещено: {moved_count}, 🧩 Пропущено: {skipped}, ⚠️ Ошибок: {errors}")
+    logger.info(f"📄 Лог сохранён: {LOG_FILE}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Photo synchronization tool")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate sync without moving files")
-    args = parser.parse_args()
-
-    main(dry_run=args.dry_run)
+    main()
