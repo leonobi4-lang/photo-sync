@@ -1,9 +1,15 @@
 FROM python:3.11-slim
 
 WORKDIR /app
-RUN pip install --no-cache-dir pillow exifread tqdm
 
-COPY sync.py run.sh ./
+# Устанавливаем tqdm (опционально, если будешь использовать)
+RUN pip install --no-cache-dir tqdm
+
+COPY sync.py /app/sync.py
+COPY run.sh /app/run.sh
+
 RUN chmod +x /app/run.sh
+
+ENV PYTHONUNBUFFERED=1
 
 CMD ["/app/run.sh"]
