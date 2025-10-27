@@ -1,11 +1,13 @@
-version: '3.8'
+version: "3.9"
 
 services:
   photo_sync:
     build: .
     container_name: photo_sync
-    restart: unless-stopped
+    restart: "no"
     volumes:
-      - /volume1/media/photos/duplicates:/duplicates
       - /volume1/media/photos/sorted:/sorted
-    command: ["/run.sh"]
+      - /volume1/media/photos/duplicates:/duplicates
+    environment:
+      - TZ=Asia/Vientiane
+    command: ["/app/run.sh"]
