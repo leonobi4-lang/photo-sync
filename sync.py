@@ -1,156 +1,142 @@
+#!/usr/bin/env python3
 import os
 import hashlib
-import shutil
-import exifread
 import json
 import time
-from datetime import datetime
-from tqdm import tqdm
-import logging
+import shutil
 import sys
+from datetime import datetime
 
-# === Константы ===
-SORTED_DIR = "/sorted"
-DUPLICATES_DIR = "/duplicates"
-LOG_DIR = "/logs"
-CACHE_FILE = os.path.join(LOG_DIR, "hash_cache.json")
-os.makedirs(LOG_DIR, exist_ok=True)
-LOG_FILE = os.path.join(LOG_DIR, f"sync_{datetime.now():%Y%m%d_%H%M%S}.log")
+# ---------- Конфигурация ----------
+HASH_FILE = "/app/hash_cache.json"
+LOG_FILE = "/sorted/sync.log"
 
-# === Настройка логов ===
-logger = logging.getLogger("photo_sync")
-logger.setLevel(logging.INFO)
-fmt = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
-fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-ch = logging.StreamHandler(sys.stdout)
-fh.setFormatter(fmt)
-ch.setFormatter(fmt)
-logger.addHandler(fh)
-logger.addHandler(ch)
+ALGO = os.getenv("HASH_ALGO", "md5")
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+MODE = os.getenv("MODE", "move").lower()        # "move" или "copy"
+STRUCTURE = os.getenv("STRUCTURE", "true").lower() == "true"  # true → /YYYY/MM/
+IGNORE_DIRS = [x.strip() for x in os.getenv("IGNORE_DIRS", "@eaDir,tmp,cache").split(",")]
+PROGRESS_INTERVAL = int(os.getenv("PROGRESS_INTERVAL", "10000"))
 
-HEARTBEAT_INTERVAL = 60  # сек между сообщениями “ещё жив”
+SRC = "/duplicates"
+DST = "/sorted"
 
+# ---------- Цвета ----------
+class C:
+    RESET = "\033[0m"
+    GRAY = "\033[90m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
 
-def hash_file(path):
-    """Вычисляет MD5-хэш файла"""
-    try:
-        with open(path, "rb") as f:
-            h = hashlib.md5()
-            while chunk := f.read(8192):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return None
+# ---------- Логирование ----------
+def log(message, color=None):
+    timestamp = time.strftime("[%Y-%m-%d %H:%M:%S]")
+    line = f"{timestamp} {message}"
+    if color:
+        print(color + line + C.RESET)
+    else:
+        print(line)
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
+# ---------- Хэширование ----------
+def file_hash(path):
+    h = hashlib.new(ALGO)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-def get_date_taken(path):
-    """Пытается извлечь дату съёмки из EXIF"""
-    try:
-        with open(path, "rb") as f:
-            tags = exifread.process_file(f, stop_tag="EXIF DateTimeOriginal", details=False)
-        date_str = str(tags.get("EXIF DateTimeOriginal"))
-        if date_str:
-            return datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S").strftime("%Y/%m/%d")
-    except Exception:
-        pass
-    return "unknown"
-
-
-def build_hash_map(base_path):
-    """Создаёт карту {hash: relative_path} с кэшем"""
-    cache = {}
-    if os.path.exists(CACHE_FILE):
+def load_cache():
+    if os.path.exists(HASH_FILE):
         try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-        except Exception:
-            logger.warning("⚠️ Повреждён кэш, пересчитываю с нуля.")
-            cache = {}
+            with open(HASH_FILE, "r") as f:
+                return json.load(f)
+        except:
+            log("[WARN] Corrupted hash cache, rebuilding...", C.YELLOW)
+    return {}
 
-    file_map = {}
-    files = [
-        os.path.join(root, f)
-        for root, _, fs in os.walk(base_path)
-        for f in fs
-        if f.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov"))
-    ]
-
-    last_beat = time.time()
-    for i, full_path in enumerate(tqdm(files, desc=f"Hashing {base_path}", unit="file")):
-        try:
-            mtime = os.path.getmtime(full_path)
-            key = f"{full_path}:{mtime}"
-            if key in cache:
-                h = cache[key]
-            else:
-                h = hash_file(full_path)
-                cache[key] = h
-            if h:
-                file_map[h] = os.path.relpath(full_path, base_path)
-        except Exception:
-            continue
-
-        # heartbeat каждые 60 с
-        if time.time() - last_beat >= HEARTBEAT_INTERVAL:
-            pct = (i + 1) / len(files) * 100 if files else 0
-            logger.info(f"💓 Hashing progress: {i+1}/{len(files)} ({pct:.2f}%)")
-            last_beat = time.time()
-
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+def save_cache(cache):
+    with open(HASH_FILE, "w") as f:
         json.dump(cache, f)
-    return file_map
 
+# ---------- Индексация ----------
+def collect_hashes(base):
+    cache = load_cache()
+    hashes = {}
+    total = 0
+    start = time.time()
 
+    for root, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if not any(ign.lower() in d.lower() for ign in IGNORE_DIRS)]
+        for file in files:
+            path = os.path.join(root, file)
+            if not os.path.isfile(path):
+                continue
+            try:
+                h = cache.get(path)
+                if not h:
+                    h = file_hash(path)
+                    cache[path] = h
+                hashes[h] = path
+            except Exception as e:
+                log(f"[WARN] Failed: {path} ({e})", C.YELLOW)
+
+            total += 1
+            if total % PROGRESS_INTERVAL == 0:
+                elapsed = time.time() - start
+                rate = total / elapsed
+                log(f"[INFO] {total} scanned ({rate:.1f} f/s)", C.GRAY)
+
+    save_cache(cache)
+    log(f"[DONE] Indexed {total} files from {base}", C.BLUE)
+    return hashes
+
+# ---------- Структура пути ----------
+def make_structured_path(base, src_path):
+    """Возвращает путь назначения /sorted/YYYY/MM/filename"""
+    mtime = os.path.getmtime(src_path)
+    dt = datetime.fromtimestamp(mtime)
+    subdir = f"{dt.year}/{dt.month:02d}"
+    return os.path.join(base, subdir, os.path.basename(src_path))
+
+# ---------- Основной процесс ----------
 def main():
-    logger.info("🔍 Сканирую каталог /sorted (это может занять время)...")
-    sorted_map = build_hash_map(SORTED_DIR)
-    logger.info(f"✅ Найдено {len(sorted_map)} уникальных файлов в sorted.")
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    log("🔄 Starting photo sync...", C.BLUE)
+    t0 = time.time()
 
-    logger.info("📁 Сканирую каталог /duplicates ...")
-    dup_files = [
-        os.path.join(root, f)
-        for root, _, files in os.walk(DUPLICATES_DIR)
-        for f in files
-        if f.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov"))
-    ]
-    logger.info(f"🧩 Найдено {len(dup_files)} файлов в duplicates.")
+    dst_hashes = collect_hashes(DST)
+    src_hashes = collect_hashes(SRC)
 
-    moved_count = skipped = errors = 0
-    last_beat = time.time()
+    new_files = [path for h, path in src_hashes.items() if h not in dst_hashes]
+    log(f"🆕 Found {len(new_files)} new files to sync.", C.GREEN)
 
-    for i, f in enumerate(tqdm(dup_files, desc="Processing duplicates", unit="file")):
-        try:
-            h = hash_file(f)
-            if not h:
-                continue
-            if h in sorted_map:
-                logger.info(f"[SKIPPED] {f} (duplicate)")
-                skipped += 1
-                continue
+    for path in new_files:
+        if STRUCTURE:
+            dest = make_structured_path(DST, path)
+        else:
+            rel = os.path.relpath(path, SRC)
+            dest = os.path.join(DST, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
 
-            date_path = get_date_taken(f)
-            dest_dir = os.path.join(SORTED_DIR, date_path)
-            os.makedirs(dest_dir, exist_ok=True)
-            dest_path = os.path.join(dest_dir, os.path.basename(f))
+        if DRY_RUN:
+            log(f"[DRY_RUN] Would {MODE}: {path} -> {dest}", C.YELLOW)
+        else:
+            try:
+                if MODE == "move":
+                    shutil.move(path, dest)
+                else:
+                    shutil.copy2(path, dest)
+                log(f"[OK] {MODE.upper()}: {path} -> {dest}", C.GREEN)
+            except Exception as e:
+                log(f"[ERROR] Failed to {MODE} {path}: {e}", C.RED)
 
-            shutil.move(f, dest_path)
-            logger.info(f"[MOVED] {f} -> {dest_path}")
-            moved_count += 1
-
-        except Exception as e:
-            logger.error(f"[ERROR] {f}: {e}")
-            errors += 1
-
-        # heartbeat каждые 60 с
-        if time.time() - last_beat >= HEARTBEAT_INTERVAL:
-            pct = (i + 1) / len(dup_files) * 100 if dup_files else 0
-            logger.info(f"💓 Still running... processed {i+1}/{len(dup_files)} ({pct:.2f}%)")
-            last_beat = time.time()
-
-    logger.info("✅ Синхронизация завершена.")
-    logger.info(f"📦 Перемещено: {moved_count}, 🧩 Пропущено: {skipped}, ⚠️ Ошибок: {errors}")
-    logger.info(f"📄 Лог сохранён: {LOG_FILE}")
-
+    elapsed = time.time() - t0
+    log(f"✅ Sync completed in {elapsed/60:.1f} minutes", C.BLUE)
 
 if __name__ == "__main__":
     main()
