@@ -1,10 +1,11 @@
 FROM python:3.11-slim
 
 WORKDIR /app
-RUN pip install --no-cache-dir pillow exifread
 
-COPY sync.py /app/sync.py
-COPY run.sh /run.sh
-RUN chmod +x /run.sh
+# Устанавливаем зависимости
+RUN pip install --no-cache-dir pillow exifread tqdm
 
-CMD ["/run.sh"]
+# Копируем файлы
+COPY sync.py run.sh ./
+
+RUN chmod +x /app/run.sh
