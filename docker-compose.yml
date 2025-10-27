@@ -4,10 +4,11 @@ services:
   photo_sync:
     build: .
     container_name: photo_sync
-    restart: "no"
+    restart: unless-stopped
     volumes:
       - /volume1/media/photos/sorted:/sorted
       - /volume1/media/photos/duplicates:/duplicates
+      - /volume1/media/photo_logs:/logs
     environment:
       - TZ=Asia/Vientiane
-    command: ["/app/run.sh"]
+    command: ["bash", "-c", "while true; do /app/run.sh; sleep 6h; done"]
