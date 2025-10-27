@@ -4,11 +4,16 @@ services:
   photo_sync:
     build: .
     container_name: photo_sync
-    restart: unless-stopped
+    restart: "no"
     volumes:
       - /volume1/media/photos/sorted:/sorted
       - /volume1/media/photos/duplicates:/duplicates
-      - /volume1/media/photo_logs:/logs
+      - /volume1/docker/appdata/photo_sync:/app
     environment:
       - TZ=Asia/Vientiane
-    command: ["bash", "-c", "while true; do /app/run.sh; sleep 6h; done"]
+      - DRY_RUN=false            # true = тест без действий
+      - MODE=move                # move или copy
+      - STRUCTURE=true           # создавать /YYYY/MM/
+      - HASH_ALGO=md5
+      - PROGRESS_INTERVAL=10000
+    command: ["/app/run.sh"]
