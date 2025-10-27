@@ -5,13 +5,29 @@ import exifread
 from datetime import datetime
 from tqdm import tqdm
 import argparse
+import logging
+import sys
 
+# === Константы ===
 SORTED_DIR = "/sorted"
 DUPLICATES_DIR = "/duplicates"
 LOG_DIR = "/logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"sync_{datetime.now():%Y%m%d_%H%M%S}.log")
 
-os.makedirs(LOG_DIR, exist_ok=True)
+# === Логирование (в файл + stdout) ===
+logger = logging.getLogger("photo_sync")
+logger.setLevel(logging.INFO)
+
+file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+console_handler = logging.StreamHandler(sys.stdout)
+
+formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 
 def hash_file(path):
@@ -52,52 +68,49 @@ def build_hash_map(base_path):
 
 
 def main(dry_run=False):
-    print("🔍 Scanning sorted directory...")
+    logger.info("🔍 Scanning sorted directory...")
     sorted_map = build_hash_map(SORTED_DIR)
-    print(f"✅ Found {len(sorted_map)} unique files in sorted folder.")
+    logger.info(f"✅ Found {len(sorted_map)} unique files in sorted folder.")
 
-    print("📁 Scanning duplicates directory...")
+    logger.info("📁 Scanning duplicates directory...")
     dup_files = []
     for root, _, files in os.walk(DUPLICATES_DIR):
         for f in files:
             dup_files.append(os.path.join(root, f))
+    logger.info(f"🧩 Found {len(dup_files)} files in duplicates folder.")
 
-    print(f"🧩 Found {len(dup_files)} files in duplicates folder.")
-    moved_count = 0
-    skipped = 0
-    errors = 0
+    moved_count = skipped = errors = 0
 
-    with open(LOG_FILE, "w", encoding="utf-8") as log:
-        for f in tqdm(dup_files, desc="Processing", unit="file"):
-            try:
-                h = hash_file(f)
-                if not h:
-                    continue
+    for f in tqdm(dup_files, desc="Processing", unit="file"):
+        try:
+            h = hash_file(f)
+            if not h:
+                continue
 
-                if h in sorted_map:
-                    log.write(f"[SKIPPED] {f} (duplicate)\n")
-                    skipped += 1
-                    continue
+            if h in sorted_map:
+                logger.info(f"[SKIPPED] {f} (duplicate)")
+                skipped += 1
+                continue
 
-                date_path = get_date_taken(f)
-                dest_dir = os.path.join(SORTED_DIR, date_path)
-                os.makedirs(dest_dir, exist_ok=True)
-                dest_path = os.path.join(dest_dir, os.path.basename(f))
+            date_path = get_date_taken(f)
+            dest_dir = os.path.join(SORTED_DIR, date_path)
+            os.makedirs(dest_dir, exist_ok=True)
+            dest_path = os.path.join(dest_dir, os.path.basename(f))
 
-                if dry_run:
-                    log.write(f"[DRY-RUN] Would move {f} -> {dest_path}\n")
-                else:
-                    shutil.move(f, dest_path)
-                    log.write(f"[MOVED] {f} -> {dest_path}\n")
-                    moved_count += 1
+            if dry_run:
+                logger.info(f"[DRY-RUN] Would move {f} -> {dest_path}")
+            else:
+                shutil.move(f, dest_path)
+                logger.info(f"[MOVED] {f} -> {dest_path}")
+                moved_count += 1
 
-            except Exception as e:
-                log.write(f"[ERROR] {f}: {e}\n")
-                errors += 1
+        except Exception as e:
+            logger.error(f"[ERROR] {f}: {e}")
+            errors += 1
 
-    print("✅ Sync complete.")
-    print(f"📦 Moved: {moved_count}, 🧩 Skipped: {skipped}, ⚠️ Errors: {errors}")
-    print(f"📄 Log saved to: {LOG_FILE}")
+    logger.info("✅ Sync complete.")
+    logger.info(f"📦 Moved: {moved_count}, 🧩 Skipped: {skipped}, ⚠️ Errors: {errors}")
+    logger.info(f"📄 Log file saved to: {LOG_FILE}")
 
 
 if __name__ == "__main__":
